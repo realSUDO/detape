@@ -11,9 +11,9 @@ from loguru import logger
 
 from .extract_frames import extract_frames_from_video
 
-# Load configuration - Using official Gemma 3n multimodal model
-# PRIMARY: Gemma 3n (requires HF access)
-MODEL_NAME = "google/gemma-3n-e2b-it"  # Gemma 3n instruction-tuned model
+# Load configuration - Using lightweight Gemma 3n multimodal model
+# PRIMARY: Gemma 3n E2B (2B params, ~2GB RAM, optimized for speed)
+MODEL_NAME = "google/gemma-3n-e2b-it"  # Lightweight Gemma 3n instruction-tuned model
 # FALLBACK: Open alternative for testing
 FALLBACK_MODEL = "Salesforce/blip-image-captioning-base"  # Open alternative
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

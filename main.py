@@ -65,8 +65,8 @@ def process_video(video_path: str) -> dict:
     Complete video processing pipeline for v0.1 Alpha
     
     Steps:
-    1. Extract frames at 2 FPS
-    2. Generate captions using Gemma 3n Vision
+    1. Extract frames at 1 FPS
+    2. Generate captions using Gemma 3n E2B Vision (lightweight)
     3. Save raw captions
     
     Returns:
@@ -89,8 +89,8 @@ def process_video(video_path: str) -> dict:
         logger.info(f"Video: {video_info['resolution']}, {video_info['duration']:.1f}s, {video_info['fps']:.1f} FPS")
         
         # Step 2: Extract frames
-        logger.info("🎞️ Extracting frames at 2 FPS...")
-        frame_paths = extract_frames_from_video(video_path, fps=2.0)
+        logger.info("🎞️ Extracting frames at 1 FPS...")
+        frame_paths = extract_frames_from_video(video_path, fps=1.0)
         results["frames_extracted"] = len(frame_paths)
         logger.success(f"Extracted {len(frame_paths)} frames")
         
