@@ -6,6 +6,11 @@ import os
 import torch
 from PIL import Image
 from transformers import AutoModelForCausalLM, AutoProcessor
+try:
+    from transformers import Gemma3nForConditionalGeneration
+except ImportError:
+    # Fallback if the specific class doesn't exist
+    Gemma3nForConditionalGeneration = AutoModelForCausalLM
 from typing import List
 from loguru import logger
 
@@ -37,7 +42,7 @@ class FrameCaptioner:
         try:
             # Load processor and model with proper settings
             self.processor = AutoProcessor.from_pretrained(self.model_name)
-            self.model = AutoModelForCausalLM.from_pretrained(
+            self.model = Gemma3nForConditionalGeneration.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float32,
                 device_map="auto" if DEVICE == "cuda" else None,
@@ -54,7 +59,7 @@ class FrameCaptioner:
             try:
                 self.model_name = self.FALLBACK_MODEL
                 self.processor = AutoProcessor.from_pretrained(self.model_name)
-                self.model = AutoModelForCausalLM.from_pretrained(
+                self.model = Gemma3nForConditionalGeneration.from_pretrained(
                     self.model_name,
                     torch_dtype=torch.float32,
                     low_cpu_mem_usage=True
@@ -73,7 +78,7 @@ class FrameCaptioner:
         captions = []
 
         # Prompt for incident analysis with proper Gemma 3n format
-        prompt = "<image>\nDescribe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."
+        prompt = "<image> Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."
 
         for i, frame_path in enumerate(frame_paths):
             try:
