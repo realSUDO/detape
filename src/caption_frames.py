@@ -72,8 +72,8 @@ class FrameCaptioner:
         frame_paths = extract_frames_from_video(video_path)
         captions = []
 
-        # Prompt for incident analysis
-        prompt = "Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."
+        # Prompt for incident analysis with proper Gemma 3n format
+        prompt = "<image>\nDescribe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."
 
         for i, frame_path in enumerate(frame_paths):
             try:
@@ -81,8 +81,8 @@ class FrameCaptioner:
                 
                 # Process inputs with both image and text prompt
                 inputs = self.processor(
-                    images=image, 
-                    text=prompt, 
+                    text=prompt,
+                    images=image,
                     return_tensors="pt"
                 )
                 
@@ -97,7 +97,7 @@ class FrameCaptioner:
                         **inputs,
                         max_new_tokens=100,
                         do_sample=False,
-                        temperature=0.1
+                        pad_token_id=self.processor.tokenizer.eos_token_id
                     )
                 
                 # Decode the response
