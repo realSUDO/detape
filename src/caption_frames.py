@@ -5,22 +5,22 @@ Generates captions for each extracted frame using Gemma 3n Vision
 import os
 import torch
 from PIL import Image
-from transformers import Gemma3nForConditionalGeneration, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoProcessor
 from typing import List
 from loguru import logger
 
 from .extract_frames import extract_frames_from_video
 
-# Load configuration - Using lightweight Gemma 3n multimodal model
+# Load configuration - Using official Gemma 3n multimodal model
 # PRIMARY: Gemma 3n E2B (2B params, ~2GB RAM, optimized for speed)
-MODEL_NAME = "google/gemma-3n-e2b-it"  # Lightweight Gemma 3n instruction-tuned model
-# FALLBACK: Open alternative for testing
-FALLBACK_MODEL = "Salesforce/blip-image-captioning-base"  # Open alternative
+MODEL_NAME = "google/gemma-3n-e2b-it"  # Official Gemma 3n instruction-tuned model
+# FALLBACK: Gemma 3n E4B for better quality if needed
+FALLBACK_MODEL = "google/gemma-3n-e4b-it"  # Larger Gemma 3n variant
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CAPTION_OUTPUT_DIR = "outputs/captions"
 
 logger.info(f"Using device: {DEVICE}")
-logger.info(f"Using Gemma 3n model: {MODEL_NAME}")
+logger.info(f"Using Gemma 3n E2B model: {MODEL_NAME}")
 
 # Ensure output directory exists
 os.makedirs(CAPTION_OUTPUT_DIR, exist_ok=True)
@@ -30,27 +30,39 @@ class FrameCaptioner:
         self.processor = None
         self.model = None
         self.model_name = model_name
-        logger.info(f"Initializing FrameCaptioner with model: {model_name}")
+        logger.info(f"Initializing FrameCaptioner with Gemma 3n model: {model_name}")
 
     def load_model(self):
-        logger.info("Loading Gemma 3n multimodal model...")
+        logger.info("Loading official Gemma 3n multimodal model...")
         try:
+            # Load processor and model with proper settings
             self.processor = AutoProcessor.from_pretrained(self.model_name)
-            self.model = Gemma3nForConditionalGeneration.from_pretrained(
+            self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
-                torch_dtype="auto",
-                device_map="auto"
+                torch_dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float32,
+                device_map="auto" if DEVICE == "cuda" else None,
+                low_cpu_mem_usage=True
             ).eval()
-            logger.success("Gemma 3n model loaded successfully")
+            
+            if DEVICE == "cpu":
+                self.model = self.model.to(DEVICE)
+                
+            logger.success("Gemma 3n E2B model loaded successfully")
         except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            logger.info("Trying fallback to CPU...")
-            self.processor = AutoProcessor.from_pretrained(self.model_name)
-            self.model = Gemma3nForConditionalGeneration.from_pretrained(
-                self.model_name,
-                torch_dtype=torch.float32
-            ).to(DEVICE)
-            logger.success("Model loaded with fallback settings")
+            logger.error(f"Failed to load Gemma 3n E2B: {e}")
+            logger.info("Trying Gemma 3n E4B fallback...")
+            try:
+                self.model_name = self.FALLBACK_MODEL
+                self.processor = AutoProcessor.from_pretrained(self.model_name)
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    torch_dtype=torch.float32,
+                    low_cpu_mem_usage=True
+                ).to(DEVICE).eval()
+                logger.success("Gemma 3n E4B fallback loaded successfully")
+            except Exception as e2:
+                logger.error(f"Both Gemma 3n models failed: {e2}")
+                raise e2
 
     def caption_frames(self, video_path: str) -> List[str]:
         if not self.model or not self.processor:
