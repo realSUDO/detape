@@ -30,7 +30,7 @@ class SummaryGenerator:
             self.model = Gemma3nForCausalLM.from_pretrained(
                 self.model_name,
                 torch_dtype="auto",
-                device_map="auto"
+                device_map={"":0}  # Force all to GPU 0
             ).eval()
 
             if self.tokenizer.pad_token is None:

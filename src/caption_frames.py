@@ -5,7 +5,7 @@ Generates captions for each extracted frame using Gemma 3n Vision
 import os
 import torch
 from PIL import Image
-from transformers import pipeline
+from transformers import AutoModelForImageTextToText, AutoProcessor
 from typing import List, Dict
 from loguru import logger
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,23 +29,25 @@ os.makedirs(CAPTION_OUTPUT_DIR, exist_ok=True)
 
 class FrameCaptioner:
     def __init__(self, model_name: str = MODEL_NAME):
-        self.pipeline = None
+        self.processor = None
+        self.model = None
         self.model_name = model_name
         logger.info(f"Initializing FrameCaptioner with Gemma 3n model: {model_name}")
 
     def load_model(self):
-        logger.info("Loading Gemma 3n Vision model using pipeline...")
+        logger.info("Loading Gemma 3n Vision model directly...")
         try:
-            # Setup pipeline
-            self.pipeline = pipeline(
-                task="image-text-to-text",
-                model=self.model_name,
-                device=0 if DEVICE == "cuda" else -1,
-                torch_dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float32
-            )
-            logger.success("Gemma 3n E2B pipeline initialized successfully")
+            # Load processor and model directly (bypass pipeline)
+            self.processor = AutoProcessor.from_pretrained(self.model_name)
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float32,
+                device_map={"":0} if DEVICE == "cuda" else "cpu"
+            ).eval()
+            
+            logger.success("Gemma 3n vision model loaded successfully")
         except Exception as e:
-            logger.error(f"Failed to initialize pipeline: {e}")
+            logger.error(f"Failed to load vision model: {e}")
             raise e
 
     def caption_single_frame(self, image_path: str) -> str:
@@ -53,27 +55,29 @@ class FrameCaptioner:
         try:
             # Optimize: Resize image to reduce processing time
             image = Image.open(image_path).convert("RGB")
-            # Resize to 640x360 for faster processing while maintaining quality
             image = image.resize((640, 360), Image.Resampling.LANCZOS)
             
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": "Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."}
-                    ]
-                }
-            ]
+            # Create prompt
+            prompt = "Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."
             
-            # Run the pipeline
-            output = self.pipeline(
-                text=messages,
-                max_new_tokens=100,
-                return_full_text=False
-            )
+            # Process inputs
+            inputs = self.processor(
+                text=prompt, 
+                images=image, 
+                return_tensors="pt", 
+                padding=True
+            ).to(self.model.device)
             
-            return output[0]["generated_text"].strip()
+            # Fix: Add dummy audio features
+            inputs["audio_features"] = None
+            
+            # Generate caption
+            with torch.no_grad():
+                generated_ids = self.model.generate(**inputs, max_new_tokens=100)
+            
+            # Decode and clean
+            caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+            return caption
             
         except Exception as e:
             logger.error(f"Failed to caption frame {image_path}: {e}")
@@ -109,7 +113,7 @@ class FrameCaptioner:
             logger.error(f"Failed to save caption cache: {e}")
 
     def caption_frames(self, video_path: str) -> List[str]:
-        if not self.pipeline:
+        if not self.model or not self.processor:
             self.load_model()
 
         # Extract frames
