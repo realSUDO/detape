@@ -10,9 +10,22 @@ from pathlib import Path
 import json
 
 # Import our modules
-from extract_frames import extract_frames_from_video, get_video_info
-from caption_frames import FrameCaptioner
-from generate_summary import SummaryGenerator
+import sys
+sys.path.append('.')
+sys.path.append('..')
+
+try:
+    from extract_frames import extract_frames_from_video, get_video_info
+    from caption_frames import FrameCaptioner
+    from generate_summary import SummaryGenerator
+except ImportError:
+    try:
+        from src.extract_frames import extract_frames_from_video, get_video_info
+        from src.caption_frames import FrameCaptioner
+        from src.generate_summary import SummaryGenerator
+    except ImportError:
+        st.error("❌ Cannot import modules. Make sure you're running from the correct directory.")
+        st.stop()
 
 # Page configuration
 st.set_page_config(
