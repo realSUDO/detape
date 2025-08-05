@@ -42,7 +42,7 @@ venv.bak/
 # Project specific
 detape.log
 *.log
-outputs/
+#outputs/
 data/frames/
 models/downloaded/
 torch
