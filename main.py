@@ -17,6 +17,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from src.extract_frames import extract_frames_from_video, get_video_info
 from src.caption_frames import FrameCaptioner
 from src.generate_summary import SummaryGenerator
+from src.analyze_audio import AudioAnalyzer
 
 def setup_logging():
     """Setup logging configuration"""

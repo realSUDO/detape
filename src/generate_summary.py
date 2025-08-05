@@ -4,6 +4,7 @@ Converts frame captions into a coherent incident summary using Gemma 3n Text
 """
 import os
 import torch
+import json
 from transformers import Gemma3nForCausalLM, AutoTokenizer
 from typing import List
 from loguru import logger
@@ -149,6 +150,28 @@ Summary:
 
         return captions
 
+    def load_captions_from_cache(self, cache_file: str = "outputs/captions/captions_cache.json") -> List[str]:
+        """Load captions from cache JSON file"""
+        captions = []
+        
+        if not os.path.exists(cache_file):
+            logger.error(f"Cache file not found: {cache_file}")
+            return captions
+            
+        try:
+            with open(cache_file, 'r') as f:
+                captions_dict = json.load(f)
+                
+            # Sort by frame order (assumes frame_000.jpg, frame_001.jpg, etc.)
+            sorted_frames = sorted(captions_dict.keys())
+            captions = [captions_dict[frame] for frame in sorted_frames]
+            logger.info(f"Loaded {len(captions)} captions from cache")
+            
+        except Exception as e:
+            logger.error(f"Error reading cache file: {e}")
+            
+        return captions
+
     def save_summary(self, summary: str, output_file: str = SUMMARY_OUTPUT_FILE):
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         with open(output_file, 'w') as f:
@@ -168,9 +191,11 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python generate_summary.py <video_path_or_captions_dir>")
+        print("Usage: python generate_summary.py <video_path_or_option>")
+        print("Options:")
         print("  - Provide video path to process entire pipeline")
-        print("  - Provide 'from_captions' to use existing caption files")
+        print("  - 'from_captions' to use existing caption .txt files")
+        print("  - 'from_cache' to use captions_cache.json")
         sys.exit(1)
 
     generator = SummaryGenerator()
@@ -182,7 +207,15 @@ if __name__ == "__main__":
             generator.save_summary(summary)
             print(f"Generated summary: {summary}")
         else:
-            print("No captions found!")
+            print("No caption files found!")
+    elif sys.argv[1] == "from_cache":
+        captions = generator.load_captions_from_cache()
+        if captions:
+            summary = generator.generate_summary_from_captions(captions)
+            generator.save_summary(summary)
+            print(f"Generated summary: {summary}")
+        else:
+            print("No cache file found!") 
     else:
         video_path = sys.argv[1]
         summary = generator.generate_summary_from_video(video_path)
