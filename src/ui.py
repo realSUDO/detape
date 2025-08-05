@@ -92,6 +92,13 @@ def main():
         fps_setting = st.slider("Frames per second", 0.5, 2.0, 1.0, 0.5)
         max_duration = st.slider("Max video duration (seconds)", 10, 120, 60, 10)
         
+        # Processing time estimate
+        estimated_frames = int(max_duration * fps_setting)
+        est_time = estimated_frames * 0.5 + 120  # ~0.5s per frame + 2min model loading
+        
+        st.warning(f"⏱️ **Processing Time Estimate**: ~{est_time/60:.1f} minutes for {estimated_frames} frames")
+        st.info("🛋️ **Please be patient!** AI models take time to load. Don't refresh the page.")
+        
         st.header("📊 Model Info")
         st.write("**Vision Model**: Gemma 3n E2B")
         st.write("**Text Model**: Gemma 3n E2B")
@@ -141,7 +148,7 @@ def process_video(uploaded_file, fps_setting, max_duration):
             video_path = tmp_file.name
         
         # Step 1: Video Analysis
-        status_text.text("📹 Analyzing video...")
+        status_text.text("📹 Analyzing video... (This will take a moment)")
         progress_bar.progress(10)
         
         video_info = get_video_info(video_path)
@@ -153,24 +160,37 @@ def process_video(uploaded_file, fps_setting, max_duration):
         st.success(f"✅ Video: {video_info['resolution']}, {video_info['duration']:.1f}s, {video_info['fps']:.1f} FPS")
         
         # Step 2: Extract Frames
-        status_text.text("🎞️ Extracting frames...")
+        status_text.text("🎞️ Extracting frames... (Quick step)")
         progress_bar.progress(25)
         
         frame_paths = extract_frames_from_video(video_path, fps=fps_setting)
         st.success(f"✅ Extracted {len(frame_paths)} frames")
         
         # Step 3: Generate Captions
-        status_text.text("🧠 Generating captions with Gemma 3n Vision...")
-        progress_bar.progress(40)
+        status_text.text("🧠 Loading Gemma 3n Vision model... (This might take 1-2 minutes, please be patient)")
+        progress_bar.progress(35)
         
         captioner = FrameCaptioner()
+        
+        status_text.text(f"🧠 Generating captions for {len(frame_paths)} frames... (Processing each frame, hold tight!)")
+        progress_bar.progress(40)
+        
         captions = captioner.caption_frames(video_path)
         st.success(f"✅ Generated {len(captions)} captions")
+        
+        # Memory cleanup - Free vision model before loading text model
+        status_text.text("🧹 Cleaning up GPU memory... (Preparing for text model)")
+        if hasattr(captioner, 'model') and captioner.model is not None:
+            del captioner.model
+            del captioner.processor
+            import torch
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
         
         progress_bar.progress(70)
         
         # Step 4: Generate Summary
-        status_text.text("📝 Creating incident summary...")
+        status_text.text("📝 Loading text model for summary generation... (Almost there, hang in there!)")
         
         generator = SummaryGenerator() 
         summary = generator.generate_summary_from_captions(captions)

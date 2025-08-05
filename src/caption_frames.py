@@ -2,7 +2,14 @@
 Caption Frames Module
 Generates captions for each extracted frame using Gemma 3n Vision
 """
+# CUDA Memory Optimization - MUST be before torch imports
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# Suppress cuDNN/cuBLAS warnings
+import absl.logging
+absl.logging.set_verbosity('info')
+
 import torch
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
