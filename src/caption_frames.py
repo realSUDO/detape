@@ -83,13 +83,21 @@ class FrameCaptioner:
         try:
             logger.info("🧪 Running model dummy output test...")
             dummy_image = Image.new("RGB", (512, 512), (0, 0, 0))
-            inputs = self.processor(images=dummy_image, return_tensors="pt")
+            dummy_text = "Describe this image."
+            
+            # CRITICAL FIX: Include both image AND text for Gemma 3n
+            inputs = self.processor(
+                images=dummy_image, 
+                text=dummy_text,
+                return_tensors="pt"
+            )
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
             
             outputs = self._safe_model_generate(inputs, max_new_tokens=64, do_sample=False)
             
             if outputs is not None:
                 logger.info(f"🧪 Model dummy output shape: {outputs.shape}")
+                logger.info(f"🧪 Dummy test passed - model can generate outputs")
             else:
                 logger.error("🧪 Dummy output test returned None")
         except Exception as e:
@@ -203,9 +211,13 @@ class FrameCaptioner:
             image = Image.open(image_path).convert("RGB")
             image = image.resize((512, 512), Image.Resampling.LANCZOS)
             
-            # Process inputs with careful device placement (image-only approach)
+            # Official approach: use processor to handle image + text (CRITICAL FIX)
+            prompt_text = "Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."
+            
+            # Process inputs with careful device placement (image + text approach)
             inputs = self.processor(
                 images=image,
+                text=prompt_text,  # CRITICAL: Add text input for Gemma 3n
                 return_tensors="pt"
             )
             
@@ -228,6 +240,10 @@ class FrameCaptioner:
             
             # Decode the output (safe since outputs validated by wrapper)
             caption = self.processor.batch_decode(outputs, skip_special_tokens=True)[0]
+            
+            # Clean up the output (remove input prompt)
+            if prompt_text in caption:
+                caption = caption.replace(prompt_text, "").strip()
             
             # Clear CUDA cache after each frame (official recommendation)
             if torch.cuda.is_available():
