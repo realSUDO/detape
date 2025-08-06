@@ -12,7 +12,7 @@ absl.logging.set_verbosity('info')
 
 import torch
 from PIL import Image
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import pipeline
 from typing import List, Dict
 from loguru import logger
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,55 +36,62 @@ os.makedirs(CAPTION_OUTPUT_DIR, exist_ok=True)
 
 class FrameCaptioner:
     def __init__(self, model_name: str = MODEL_NAME):
-        self.processor = None
-        self.model = None
+        self.pipeline = None
         self.model_name = model_name
         logger.info(f"Initializing FrameCaptioner with Gemma 3n model: {model_name}")
 
     def load_model(self):
-        logger.info("Loading Gemma 3n Vision model directly...")
+        logger.info("Loading Gemma 3n Vision model using official pipeline...")
         try:
-            # Load processor and model directly (bypass pipeline)
-            self.processor = AutoProcessor.from_pretrained(self.model_name)
-            self.model = AutoModelForImageTextToText.from_pretrained(
-                self.model_name,
-                torch_dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float32,
-                device_map={"":0} if DEVICE == "cuda" else "cpu"
-            ).eval()
+            # Official pipeline approach per Google AI documentation
+            self.pipeline = pipeline(
+                task="image-text-to-text",
+                model=self.model_name,
+                device="cuda" if DEVICE == "cuda" else "cpu",
+                torch_dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float32
+            )
             
-            logger.success("Gemma 3n vision model loaded successfully")
+            logger.success("Gemma 3n vision pipeline loaded successfully")
         except Exception as e:
-            logger.error(f"Failed to load vision model: {e}")
+            logger.error(f"Failed to load vision pipeline: {e}")
             raise e
 
     def caption_single_frame(self, image_path: str) -> str:
-        """Caption a single frame with optimizations"""
+        """Caption a single frame using official pipeline approach"""
         try:
-            # Optimize: Resize image to reduce processing time
+            # Load and resize image
             image = Image.open(image_path).convert("RGB")
             image = image.resize((640, 360), Image.Resampling.LANCZOS)
             
-            # Create prompt
-            prompt = "Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."
+            # Official message format per Google AI docs
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": "Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."}
+                    ]
+                }
+            ]
             
-            # Process inputs
-            inputs = self.processor(
-                text=prompt, 
-                images=image, 
-                return_tensors="pt", 
-                padding=True
-            ).to(self.model.device)
+            # Use pipeline with official format - no manual token handling needed
+            result = self.pipeline(
+                text=messages,
+                max_new_tokens=100,
+                return_full_text=False
+            )
             
-            # Fix: Add dummy audio features
-            inputs["audio_features"] = None
+            # Extract generated text from pipeline result
+            if isinstance(result, list) and len(result) > 0:
+                if isinstance(result[0], dict) and "generated_text" in result[0]:
+                    generated = result[0]["generated_text"]
+                    if isinstance(generated, list) and len(generated) > 0:
+                        # Extract content from the last message
+                        return generated[-1].get("content", "").strip()
+                    else:
+                        return str(generated).strip()
             
-            # Generate caption
-            with torch.no_grad():
-                generated_ids = self.model.generate(**inputs, max_new_tokens=100)
-            
-            # Decode and clean
-            caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-            return caption
+            return "Generated caption extraction failed"
             
         except Exception as e:
             logger.error(f"Failed to caption frame {image_path}: {e}")
@@ -120,7 +127,7 @@ class FrameCaptioner:
             logger.error(f"Failed to save caption cache: {e}")
 
     def caption_frames(self, video_path: str) -> List[str]:
-        if not self.model or not self.processor:
+        if not self.pipeline:
             self.load_model()
 
         # Extract frames

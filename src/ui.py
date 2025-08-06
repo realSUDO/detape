@@ -180,9 +180,8 @@ def process_video(uploaded_file, fps_setting, max_duration):
         
         # Memory cleanup - Free vision model before loading text model
         status_text.text("🧹 Cleaning up GPU memory... (Preparing for text model)")
-        if hasattr(captioner, 'model') and captioner.model is not None:
-            del captioner.model
-            del captioner.processor
+        if hasattr(captioner, 'pipeline') and captioner.pipeline is not None:
+            del captioner.pipeline
             import torch
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
