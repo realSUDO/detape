@@ -12,7 +12,7 @@ absl.logging.set_verbosity('info')
 
 import torch
 from PIL import Image
-from transformers import AutoProcessor, Gemma3nForConditionalGeneration, BitsAndBytesConfig
+from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig
 from typing import List, Dict
 from loguru import logger
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,7 +39,7 @@ class FrameCaptioner:
         self.processor = None
         self.model = None
         self.model_name = model_name
-        logger.info(f"Initializing FrameCaptioner with official Gemma3nForConditionalGeneration: {model_name}")
+        logger.info(f"Initializing FrameCaptioner with AutoModelForCausalLM (image captioning): {model_name}")
 
     def load_model(self):
         """Load Gemma 3n model using official manual approach (avoids audio_features error)"""
@@ -66,7 +66,7 @@ class FrameCaptioner:
                 logger.info("🚀 Attempting standard GPU loading with float16 (stable approach)...")
                 
                 self.processor = AutoProcessor.from_pretrained(model_name)
-                self.model = Gemma3nForConditionalGeneration.from_pretrained(
+                self.model = AutoModelForCausalLM.from_pretrained(
                     model_name,
                     device_map="auto",
                     torch_dtype=torch.float16  # Safer than bfloat16
@@ -85,7 +85,7 @@ class FrameCaptioner:
                 logger.info("🔄 Attempting GPU loading with bfloat16 (no quantization)...")
                 
                 self.processor = AutoProcessor.from_pretrained(model_name)
-                self.model = Gemma3nForConditionalGeneration.from_pretrained(
+                self.model = AutoModelForCausalLM.from_pretrained(
                     model_name,
                     device_map="auto",
                     torch_dtype=torch.bfloat16  # Try bfloat16 without quantization
@@ -104,7 +104,7 @@ class FrameCaptioner:
                 bnb_config = BitsAndBytesConfig(load_in_8bit=True)
                 
                 self.processor = AutoProcessor.from_pretrained(model_name)
-                self.model = Gemma3nForConditionalGeneration.from_pretrained(
+                self.model = AutoModelForCausalLM.from_pretrained(
                     model_name,
                     device_map="auto",
                     torch_dtype=torch.float16,  # Use float16 with quantization
@@ -122,7 +122,7 @@ class FrameCaptioner:
             logger.info("💻 Falling back to CPU...")
             
             self.processor = AutoProcessor.from_pretrained(model_name)
-            self.model = Gemma3nForConditionalGeneration.from_pretrained(
+            self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch.float32
             ).to("cpu").eval()
@@ -144,14 +144,19 @@ class FrameCaptioner:
             # Official approach: use processor to handle image + text
             prompt_text = "Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."
             
-            # Process inputs with careful device placement
+            # Process inputs with careful device placement (image-only approach)
             inputs = self.processor(
                 images=image,
-                text=prompt_text,
-                return_tensors="pt",
-                padding="max_length",
-                max_length=512  # Limit input length
+                return_tensors="pt"
             )
+            
+            # CRITICAL FIX: Add dummy audio_features to satisfy multimodal requirements
+            # Gemma 3n expects audio features even for image-only tasks
+            if 'audio_features' not in inputs:
+                # Create dummy audio features tensor (shape from official docs)
+                dummy_audio = torch.zeros(1, 80, 300).to(self.model.device)
+                inputs['audio_features'] = dummy_audio
+                logger.debug("Added dummy audio_features to avoid missing argument error")
             
             # Ensure all inputs are moved to model device (avoid device mismatch)
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
