@@ -4,7 +4,7 @@ Generates captions for each extracted frame using Gemma 3n Vision
 """
 # CUDA Memory Optimization - MUST be before torch imports
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
 
 # Suppress cuDNN/cuBLAS warnings
 import absl.logging
@@ -73,6 +73,7 @@ class FrameCaptioner:
                 ).eval()
                 
                 logger.success(f"✅ Model {model_name} loaded on GPU with float16 (stable)")
+                logger.info(f"🗺️ Model device: {self.model.device}")
                 return True
                 
             except Exception as float16_error:
@@ -143,22 +144,30 @@ class FrameCaptioner:
             # Official approach: use processor to handle image + text
             prompt_text = "Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."
             
+            # Process inputs with careful device placement
             inputs = self.processor(
                 images=image,
                 text=prompt_text,
                 return_tensors="pt",
                 padding="max_length",
                 max_length=512  # Limit input length
-            ).to(self.model.device)
+            )
             
-            # Generate with proper limits
+            # Ensure all inputs are moved to model device (avoid device mismatch)
+            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+            
+            # Debug: Log model device for troubleshooting
+            logger.debug(f"Model device: {self.model.device}, Input keys: {list(inputs.keys())}")
+            
+            # Generate with proper limits and error handling
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
                     max_new_tokens=128,  # Official memory limit
                     temperature=0.7,
                     do_sample=True,
-                    pad_token_id=self.processor.tokenizer.eos_token_id
+                    pad_token_id=self.processor.tokenizer.eos_token_id,
+                    use_cache=True  # Enable KV cache for efficiency
                 )
             
             # Decode the output
