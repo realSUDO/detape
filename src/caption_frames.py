@@ -12,7 +12,7 @@ absl.logging.set_verbosity('info')
 
 import torch
 from PIL import Image
-from transformers import pipeline
+from transformers import pipeline, BitsAndBytesConfig
 from typing import List, Dict
 from loguru import logger
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,29 +41,83 @@ class FrameCaptioner:
         logger.info(f"Initializing FrameCaptioner with Gemma 3n model: {model_name}")
 
     def load_model(self):
-        logger.info("Loading Gemma 3n Vision model using official pipeline...")
+        """Load Gemma 3n model with official guidance: 8-bit quantization and fallback"""
+        logger.info(f"Loading Gemma 3n Vision model: {self.model_name}")
+        
+        # Try to load primary model with various strategies
+        success = self._try_load_model_configurations(self.model_name)
+        
+        # If primary model fails and we're using E2B, try fallback to E4B
+        if not success and self.model_name == MODEL_NAME:
+            logger.warning(f"⚠️ Primary model {self.model_name} failed, trying fallback model {FALLBACK_MODEL}")
+            self.model_name = FALLBACK_MODEL
+            success = self._try_load_model_configurations(self.model_name)
+        
+        if not success:
+            raise RuntimeError("❌ All model loading strategies failed")
+    
+    def _try_load_model_configurations(self, model_name: str) -> bool:
+        """Try different model loading configurations per official guidance"""
+        
+        # Strategy 1: 8-bit quantization for memory efficiency (official recommendation)
+        if torch.cuda.is_available():
+            try:
+                logger.info("🚀 Attempting 8-bit quantization loading (memory optimized)...")
+                bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+                
+                self.pipeline = pipeline(
+                    task="image-text-to-text",
+                    model=model_name,
+                    device_map="auto",
+                    torch_dtype=torch.bfloat16,
+                    quantization_config=bnb_config
+                )
+                logger.success(f"✅ Model {model_name} loaded with 8-bit quantization")
+                return True
+                
+            except Exception as quant_error:
+                logger.warning(f"⚠️ 8-bit quantization failed: {quant_error}")
+        
+        # Strategy 2: Standard GPU loading
+        if torch.cuda.is_available():
+            try:
+                logger.info("🔄 Attempting standard GPU loading...")
+                self.pipeline = pipeline(
+                    task="image-text-to-text",
+                    model=model_name,
+                    device="cuda",
+                    torch_dtype=torch.bfloat16
+                )
+                logger.success(f"✅ Model {model_name} loaded on GPU")
+                return True
+                
+            except Exception as gpu_error:
+                logger.warning(f"⚠️ GPU loading failed: {gpu_error}")
+        
+        # Strategy 3: CPU fallback
         try:
-            # Official pipeline approach per Google AI documentation
+            logger.info("💻 Falling back to CPU...")
             self.pipeline = pipeline(
                 task="image-text-to-text",
-                model=self.model_name,
-                device="cuda" if DEVICE == "cuda" else "cpu",
-                torch_dtype=torch.bfloat16 if DEVICE == "cuda" else torch.float32
+                model=model_name,
+                device="cpu",
+                torch_dtype=torch.float32
             )
+            logger.success(f"✅ Model {model_name} loaded on CPU")
+            return True
             
-            logger.success("Gemma 3n vision pipeline loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load vision pipeline: {e}")
-            raise e
+        except Exception as cpu_error:
+            logger.error(f"❌ CPU loading failed: {cpu_error}")
+            return False
 
     def caption_single_frame(self, image_path: str) -> str:
-        """Caption a single frame using official pipeline approach"""
+        """Caption a single frame using official Gemma 3n guidance"""
         try:
-            # Load and resize image
+            # Load and resize image per official docs: max 512x512 for memory control
             image = Image.open(image_path).convert("RGB")
-            image = image.resize((640, 360), Image.Resampling.LANCZOS)
+            image = image.resize((512, 512), Image.Resampling.LANCZOS)  # Official recommended size
             
-            # Official message format per Google AI docs
+            # Official message format for Gemma 3n pipeline
             messages = [
                 {
                     "role": "user",
@@ -74,12 +128,16 @@ class FrameCaptioner:
                 }
             ]
             
-            # Use pipeline with official format - no manual token handling needed
+            # Use pipeline with proper memory limits per official guidance
             result = self.pipeline(
-                text=messages,
-                max_new_tokens=100,
+                messages,  # Pass messages directly, not as text=messages
+                max_new_tokens=128,  # Official limit for memory control
                 return_full_text=False
             )
+            
+            # Clear CUDA cache after each frame (official recommendation)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             # Extract generated text from pipeline result
             if isinstance(result, list) and len(result) > 0:
@@ -90,11 +148,20 @@ class FrameCaptioner:
                         return generated[-1].get("content", "").strip()
                     else:
                         return str(generated).strip()
+                else:
+                    return str(result[0]).strip()
+            elif isinstance(result, dict) and "generated_text" in result:
+                return result["generated_text"].strip()
+            elif isinstance(result, str):
+                return result.strip()
             
             return "Generated caption extraction failed"
             
         except Exception as e:
             logger.error(f"Failed to caption frame {image_path}: {e}")
+            # Clear CUDA cache even on error
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return f"Error: Could not process {os.path.basename(image_path)}"
 
     def caption_frame_safe(self, image_path: str) -> tuple:
