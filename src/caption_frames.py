@@ -12,7 +12,7 @@ absl.logging.set_verbosity('info')
 
 import torch
 from PIL import Image
-from transformers import pipeline, BitsAndBytesConfig
+from transformers import AutoProcessor, Gemma3nForConditionalGeneration, BitsAndBytesConfig
 from typing import List, Dict
 from loguru import logger
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,13 +36,14 @@ os.makedirs(CAPTION_OUTPUT_DIR, exist_ok=True)
 
 class FrameCaptioner:
     def __init__(self, model_name: str = MODEL_NAME):
-        self.pipeline = None
+        self.processor = None
+        self.model = None
         self.model_name = model_name
-        logger.info(f"Initializing FrameCaptioner with Gemma 3n model: {model_name}")
+        logger.info(f"Initializing FrameCaptioner with official Gemma3nForConditionalGeneration: {model_name}")
 
     def load_model(self):
-        """Load Gemma 3n model with official guidance: 8-bit quantization and fallback"""
-        logger.info(f"Loading Gemma 3n Vision model: {self.model_name}")
+        """Load Gemma 3n model using official manual approach (avoids audio_features error)"""
+        logger.info(f"Loading Gemma 3n Vision model using official classes: {self.model_name}")
         
         # Try to load primary model with various strategies
         success = self._try_load_model_configurations(self.model_name)
@@ -57,22 +58,23 @@ class FrameCaptioner:
             raise RuntimeError("❌ All model loading strategies failed")
     
     def _try_load_model_configurations(self, model_name: str) -> bool:
-        """Try different model loading configurations per official guidance"""
+        """Try different model loading configurations using official classes"""
         
-        # Strategy 1: 8-bit quantization for memory efficiency (official recommendation)
+        # Strategy 1: 8-bit quantization for memory efficiency
         if torch.cuda.is_available():
             try:
-                logger.info("🚀 Attempting 8-bit quantization loading (memory optimized)...")
+                logger.info("🚀 Attempting 8-bit quantization loading (official classes)...")
                 bnb_config = BitsAndBytesConfig(load_in_8bit=True)
                 
-                self.pipeline = pipeline(
-                    task="image-text-to-text",
-                    model=model_name,
+                self.processor = AutoProcessor.from_pretrained(model_name)
+                self.model = Gemma3nForConditionalGeneration.from_pretrained(
+                    model_name,
                     device_map="auto",
                     torch_dtype=torch.bfloat16,
                     quantization_config=bnb_config
-                )
-                logger.success(f"✅ Model {model_name} loaded with 8-bit quantization")
+                ).eval()
+                
+                logger.success(f"✅ Model {model_name} loaded with 8-bit quantization (official classes)")
                 return True
                 
             except Exception as quant_error:
@@ -81,14 +83,15 @@ class FrameCaptioner:
         # Strategy 2: Standard GPU loading
         if torch.cuda.is_available():
             try:
-                logger.info("🔄 Attempting standard GPU loading...")
-                self.pipeline = pipeline(
-                    task="image-text-to-text",
-                    model=model_name,
-                    device="cuda",
+                logger.info("🔄 Attempting standard GPU loading (official classes)...")
+                
+                self.processor = AutoProcessor.from_pretrained(model_name)
+                self.model = Gemma3nForConditionalGeneration.from_pretrained(
+                    model_name,
                     torch_dtype=torch.bfloat16
-                )
-                logger.success(f"✅ Model {model_name} loaded on GPU")
+                ).to(DEVICE).eval()
+                
+                logger.success(f"✅ Model {model_name} loaded on GPU (official classes)")
                 return True
                 
             except Exception as gpu_error:
@@ -96,14 +99,15 @@ class FrameCaptioner:
         
         # Strategy 3: CPU fallback
         try:
-            logger.info("💻 Falling back to CPU...")
-            self.pipeline = pipeline(
-                task="image-text-to-text",
-                model=model_name,
-                device="cpu",
+            logger.info("💻 Falling back to CPU (official classes)...")
+            
+            self.processor = AutoProcessor.from_pretrained(model_name)
+            self.model = Gemma3nForConditionalGeneration.from_pretrained(
+                model_name,
                 torch_dtype=torch.float32
-            )
-            logger.success(f"✅ Model {model_name} loaded on CPU")
+            ).to("cpu").eval()
+            
+            logger.success(f"✅ Model {model_name} loaded on CPU (official classes)")
             return True
             
         except Exception as cpu_error:
@@ -111,51 +115,45 @@ class FrameCaptioner:
             return False
 
     def caption_single_frame(self, image_path: str) -> str:
-        """Caption a single frame using official Gemma 3n guidance"""
+        """Caption a single frame using official Gemma3nForConditionalGeneration approach"""
         try:
-            # Load and resize image per official docs: max 512x512 for memory control
+            # Load and resize image per official docs: 512x512 for memory control
             image = Image.open(image_path).convert("RGB")
-            image = image.resize((512, 512), Image.Resampling.LANCZOS)  # Official recommended size
+            image = image.resize((512, 512), Image.Resampling.LANCZOS)
             
-            # Official message format for Gemma 3n pipeline
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": "Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."}
-                    ]
-                }
-            ]
+            # Official approach: use processor to handle image + text
+            prompt_text = "Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."
             
-            # Use pipeline with proper memory limits per official guidance
-            result = self.pipeline(
-                messages,  # Pass messages directly, not as text=messages
-                max_new_tokens=128,  # Official limit for memory control
-                return_full_text=False
-            )
+            inputs = self.processor(
+                images=image,
+                text=prompt_text,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=512  # Limit input length
+            ).to(self.model.device)
+            
+            # Generate with proper limits
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=128,  # Official memory limit
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=self.processor.tokenizer.eos_token_id
+                )
+            
+            # Decode the output
+            caption = self.processor.batch_decode(outputs, skip_special_tokens=True)[0]
+            
+            # Clean up the output (remove input prompt)
+            if prompt_text in caption:
+                caption = caption.replace(prompt_text, "").strip()
             
             # Clear CUDA cache after each frame (official recommendation)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
-            # Extract generated text from pipeline result
-            if isinstance(result, list) and len(result) > 0:
-                if isinstance(result[0], dict) and "generated_text" in result[0]:
-                    generated = result[0]["generated_text"]
-                    if isinstance(generated, list) and len(generated) > 0:
-                        # Extract content from the last message
-                        return generated[-1].get("content", "").strip()
-                    else:
-                        return str(generated).strip()
-                else:
-                    return str(result[0]).strip()
-            elif isinstance(result, dict) and "generated_text" in result:
-                return result["generated_text"].strip()
-            elif isinstance(result, str):
-                return result.strip()
-            
-            return "Generated caption extraction failed"
+            return caption.strip() if caption.strip() else "No description generated"
             
         except Exception as e:
             logger.error(f"Failed to caption frame {image_path}: {e}")
@@ -194,7 +192,7 @@ class FrameCaptioner:
             logger.error(f"Failed to save caption cache: {e}")
 
     def caption_frames(self, video_path: str) -> List[str]:
-        if not self.pipeline:
+        if not self.model or not self.processor:
             self.load_model()
 
         # Extract frames
