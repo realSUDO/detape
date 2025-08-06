@@ -1,6 +1,7 @@
 """
 Detape v1.0 - Streamlit UI
 Interactive web interface for video-to-report pipeline
+Enhanced with community workarounds for Gemma 3n audio issues
 """
 import streamlit as st
 import os
@@ -8,6 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 import json
+import torch
 
 # Import our modules
 import sys
@@ -17,12 +19,20 @@ sys.path.append('..')
 try:
     from extract_frames import extract_frames_from_video, get_video_info
     from caption_frames import FrameCaptioner
-    from generate_summary import SummaryGenerator
+    try:
+        from generate_summary import SummaryGenerator
+    except ImportError:
+        st.warning("⚠️ SummaryGenerator not available - summary generation will be skipped")
+        SummaryGenerator = None
 except ImportError:
     try:
         from src.extract_frames import extract_frames_from_video, get_video_info
         from src.caption_frames import FrameCaptioner
-        from src.generate_summary import SummaryGenerator
+        try:
+            from src.generate_summary import SummaryGenerator
+        except ImportError:
+            st.warning("⚠️ SummaryGenerator not available - summary generation will be skipped")
+            SummaryGenerator = None
     except ImportError:
         st.error("❌ Cannot import modules. Make sure you're running from the correct directory.")
         st.stop()
@@ -85,8 +95,11 @@ def main():
         st.write("1. **Upload Video** - .mp4, .avi, .mov")
         st.write("2. **Extract Frames** - 1 FPS sampling")
         st.write("3. **Generate Captions** - Gemma 3n Vision")
-        st.write("4. **Create Summary** - Gemma 3n Text")
-        st.write("5. **View Results** - Structured report")
+        if SummaryGenerator is not None:
+            st.write("4. **Create Summary** - Gemma 3n Text")
+            st.write("5. **View Results** - Structured report")
+        else:
+            st.write("4. **View Captions** - Frame analysis only")
         
         st.header("⚙️ Settings")
         fps_setting = st.slider("Frames per second", 0.5, 2.0, 1.0, 0.5)
@@ -96,13 +109,29 @@ def main():
         estimated_frames = int(max_duration * fps_setting)
         est_time = estimated_frames * 0.5 + 120  # ~0.5s per frame + 2min model loading
         
-        st.warning(f"⏱️ **Processing Time Estimate**: ~{est_time/60:.1f} minutes for {estimated_frames} frames")
-        st.info("🛋️ **Please be patient!** AI models take time to load. Don't refresh the page.")
+        st.warning(f"⌛️ **Processing Time Estimate**: ~{est_time/60:.1f} minutes for {estimated_frames} frames")
+        st.info("🛌️ **Please be patient!** AI models take time to load. Don't refresh the page.")
+        
+        # System information
+        st.header("🖥️ System Info")
+        device = "CUDA" if torch.cuda.is_available() else "CPU"
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            st.write(f"**Device**: {device}")
+            st.write(f"**GPU**: {gpu_name}")
+            st.write(f"**Memory**: {gpu_memory:.1f} GB")
+        else:
+            st.write(f"**Device**: {device}")
         
         st.header("📊 Model Info")
         st.write("**Vision Model**: Gemma 3n E2B")
-        st.write("**Text Model**: Gemma 3n E2B")
+        if SummaryGenerator is not None:
+            st.write("**Text Model**: Gemma 3n E2B")
+        else:
+            st.write("**Text Model**: Not available")
         st.write("**Processing**: Offline")
+        st.write("🔧 **Community Workarounds**: Enabled")
 
     # Main content area
     col1, col2 = st.columns([1, 1])
@@ -179,24 +208,31 @@ def process_video(uploaded_file, fps_setting, max_duration):
         st.success(f"✅ Generated {len(captions)} captions")
         
         # Memory cleanup - Free vision model before loading text model
-        status_text.text("🧹 Cleaning up GPU memory... (Preparing for text model)")
-        if hasattr(captioner, 'pipeline') and captioner.pipeline is not None:
-            del captioner.pipeline
-            import torch
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+        status_text.text("🧹 Cleaning up GPU memory...")
+        if hasattr(captioner, 'model') and captioner.model is not None:
+            del captioner.model
+            del captioner.processor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
         
         progress_bar.progress(70)
         
-        # Step 4: Generate Summary
-        status_text.text("📝 Loading text model for summary generation... (Almost there, hang in there!)")
+        # Step 4: Generate Summary (if available)
+        summary = "Frame-by-frame analysis completed. Summary generation not available."
         
-        generator = SummaryGenerator() 
-        summary = generator.generate_summary_from_captions(captions)
-        generator.save_summary(summary)
-        
-        progress_bar.progress(90)
-        st.success("✅ Summary generated successfully")
+        if SummaryGenerator is not None:
+            status_text.text("📝 Loading text model for summary generation... (Almost there, hang in there!)")
+            
+            generator = SummaryGenerator() 
+            summary = generator.generate_summary_from_captions(captions)
+            generator.save_summary(summary)
+            
+            progress_bar.progress(90)
+            st.success("✅ Summary generated successfully")
+        else:
+            progress_bar.progress(90)
+            st.info("ℹ️ Summary generation skipped - module not available")
         
         # Step 5: Display Results
         status_text.text("📊 Displaying results...")

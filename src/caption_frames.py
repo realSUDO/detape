@@ -17,6 +17,7 @@ from typing import List, Dict
 from loguru import logger
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import sys
 
 from .extract_frames import extract_frames_from_video
 
@@ -40,6 +41,59 @@ class FrameCaptioner:
         self.model = None
         self.model_name = model_name
         logger.info(f"Initializing FrameCaptioner with AutoModelForCausalLM (image captioning): {model_name}")
+    
+    def _inject_dummy_audio_features(self, inputs: dict) -> dict:
+        """OFFICIAL WORKAROUND: Inject dummy audio_features to bypass Gemma 3n audio requirement"""
+        if 'audio_features' not in inputs:
+            dummy_audio = torch.zeros(1, 80, 300, dtype=torch.float16).to(self.model.device)
+            inputs['audio_features'] = dummy_audio
+            logger.debug("✅ Injected dummy audio_features (Gemma 3n workaround)")
+        return inputs
+    
+    def _validate_generation_inputs(self, inputs: dict) -> bool:
+        """Validate inputs before calling model.generate()"""
+        required_keys = ['input_ids', 'attention_mask', 'audio_features']
+        for key in required_keys:
+            if key not in inputs:
+                logger.error(f"❌ Missing required input key: {key}")
+                return False
+        return True
+    
+    def _safe_model_generate(self, inputs: dict, **generation_kwargs) -> torch.Tensor:
+        """Centralized safe generation wrapper with validation and error handling"""
+        try:
+            inputs = self._inject_dummy_audio_features(inputs)
+            if not self._validate_generation_inputs(inputs):
+                return None
+            
+            with torch.no_grad():
+                outputs = self.model.generate(**inputs, **generation_kwargs)
+            
+            if outputs is None or not isinstance(outputs, torch.Tensor) or outputs.numel() == 0:
+                logger.error(f"❌ Model returned invalid output: {outputs}")
+                return None
+            
+            return outputs
+        except Exception as e:
+            logger.error(f"❌ Model generation failed: {e}")
+            return None
+    
+    def check_model_output_shape(self):
+        """Diagnostic helper to test model output with dummy inputs"""
+        try:
+            logger.info("🧪 Running model dummy output test...")
+            dummy_image = Image.new("RGB", (512, 512), (0, 0, 0))
+            inputs = self.processor(images=dummy_image, return_tensors="pt")
+            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+            
+            outputs = self._safe_model_generate(inputs, max_new_tokens=64, do_sample=False)
+            
+            if outputs is not None:
+                logger.info(f"🧪 Model dummy output shape: {outputs.shape}")
+            else:
+                logger.error("🧪 Dummy output test returned None")
+        except Exception as e:
+            logger.error(f"❌ Dummy output test failed: {e}")
 
     def load_model(self):
         """Load Gemma 3n model using official manual approach (avoids audio_features error)"""
@@ -72,8 +126,16 @@ class FrameCaptioner:
                     torch_dtype=torch.float16  # Safer than bfloat16
                 ).eval()
                 
+                # Fix tokenizer pad_token for proper decoding
+                if self.processor.tokenizer.pad_token is None:
+                    self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
+                    logger.debug("Fixed tokenizer pad_token for decoding")
+                
                 logger.success(f"✅ Model {model_name} loaded on GPU with float16 (stable)")
                 logger.info(f"🗺️ Model device: {self.model.device}")
+                
+                # Run dummy test to verify model output
+                self.check_model_output_shape()
                 return True
                 
             except Exception as float16_error:
@@ -135,14 +197,11 @@ class FrameCaptioner:
             return False
 
     def caption_single_frame(self, image_path: str) -> str:
-        """Caption a single frame using official Gemma3nForConditionalGeneration approach"""
+        """Caption a single frame using safe generation wrapper (community workaround)"""
         try:
             # Load and resize image per official docs: 512x512 for memory control
             image = Image.open(image_path).convert("RGB")
             image = image.resize((512, 512), Image.Resampling.LANCZOS)
-            
-            # Official approach: use processor to handle image + text
-            prompt_text = "Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."
             
             # Process inputs with careful device placement (image-only approach)
             inputs = self.processor(
@@ -150,37 +209,25 @@ class FrameCaptioner:
                 return_tensors="pt"
             )
             
-            # CRITICAL FIX: Add dummy audio_features to satisfy multimodal requirements
-            # Gemma 3n expects audio features even for image-only tasks
-            if 'audio_features' not in inputs:
-                # Create dummy audio features tensor (shape from official docs)
-                dummy_audio = torch.zeros(1, 80, 300).to(self.model.device)
-                inputs['audio_features'] = dummy_audio
-                logger.debug("Added dummy audio_features to avoid missing argument error")
-            
-            # Ensure all inputs are moved to model device (avoid device mismatch)
+            # Move all inputs to model device (avoid device mismatch)
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
             
-            # Debug: Log model device for troubleshooting
-            logger.debug(f"Model device: {self.model.device}, Input keys: {list(inputs.keys())}")
+            # Use centralized safe generation (handles dummy audio injection + validation)
+            outputs = self._safe_model_generate(
+                inputs,
+                max_new_tokens=128,
+                temperature=0.7,
+                do_sample=True,
+                pad_token_id=self.processor.tokenizer.eos_token_id,
+                use_cache=True
+            )
             
-            # Generate with proper limits and error handling
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=128,  # Official memory limit
-                    temperature=0.7,
-                    do_sample=True,
-                    pad_token_id=self.processor.tokenizer.eos_token_id,
-                    use_cache=True  # Enable KV cache for efficiency
-                )
+            # Check if safe generation failed
+            if outputs is None:
+                return "Error: Model generation failed"
             
-            # Decode the output
+            # Decode the output (safe since outputs validated by wrapper)
             caption = self.processor.batch_decode(outputs, skip_special_tokens=True)[0]
-            
-            # Clean up the output (remove input prompt)
-            if prompt_text in caption:
-                caption = caption.replace(prompt_text, "").strip()
             
             # Clear CUDA cache after each frame (official recommendation)
             if torch.cuda.is_available():

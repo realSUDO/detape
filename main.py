@@ -1,23 +1,33 @@
 """
-Detape v0.1 Alpha - Main Runner
-Master script for the video-to-report pipeline
+Detape v1.0 - Main Runner
+Master script for the video-to-report pipeline with enhanced Gemma 3n support
 
 Usage:
     python main.py <video_path>
+    
+Features:
+- Enhanced frame captioning with community workarounds for Gemma 3n audio issues
+- Bulletproof error handling and validation
+- Comprehensive logging and debugging
+- Memory optimization for GPU processing
 """
 import sys
 import os
 import time
 from pathlib import Path
 from loguru import logger
+import torch
 
 # Add src to path for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.extract_frames import extract_frames_from_video, get_video_info
 from src.caption_frames import FrameCaptioner
-from src.generate_summary import SummaryGenerator
-from src.analyze_audio import AudioAnalyzer
+try:
+    from src.generate_summary import SummaryGenerator
+except ImportError:
+    logger.warning("SummaryGenerator not available - summary generation will be skipped")
+    SummaryGenerator = None
 
 def setup_logging():
     """Setup logging configuration"""
@@ -34,15 +44,31 @@ def setup_logging():
     )
 
 def print_banner():
-    """Print Detape banner"""
+    """Print Detape banner with system information"""
     banner = """
     ╔═══════════════════════════════════════╗
-    ║           DETAPE v0.1 Alpha           ║
+    ║           DETAPE v1.0 Beta            ║
     ║     AI Video Incident Report Tool     ║
+    ║        Enhanced Gemma 3n Support      ║
     ╚═══════════════════════════════════════╝
     """
     print(banner)
-    logger.info("Starting Detape v0.1 Alpha")
+    
+    # System information
+    device = "CUDA" if torch.cuda.is_available() else "CPU"
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"    🖥️  Processing Device: {device} ({gpu_name})")
+        print(f"    💾 GPU Memory: {gpu_memory:.1f} GB")
+    else:
+        print(f"    🖥️  Processing Device: {device}")
+    
+    print(f"    🧠 AI Models: Gemma 3n E2B (Vision + Text)")
+    print(f"    🔧 Community Workarounds: Enabled")
+    print()
+    
+    logger.info(f"Starting Detape v1.0 Beta on {device}")
 
 def validate_video_file(video_path: str) -> bool:
     """Validate input video file"""
