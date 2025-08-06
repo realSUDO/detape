@@ -58,48 +58,67 @@ class FrameCaptioner:
             raise RuntimeError("❌ All model loading strategies failed")
     
     def _try_load_model_configurations(self, model_name: str) -> bool:
-        """Try different model loading configurations using official classes"""
+        """Try different model loading configurations (stable approach to fix cublasLt error)"""
         
-        # Strategy 1: 8-bit quantization for memory efficiency
+        # Strategy 1: Standard GPU loading with float16 (safer than bfloat16 + quantization)
         if torch.cuda.is_available():
             try:
-                logger.info("🚀 Attempting 8-bit quantization loading (official classes)...")
+                logger.info("🚀 Attempting standard GPU loading with float16 (stable approach)...")
+                
+                self.processor = AutoProcessor.from_pretrained(model_name)
+                self.model = Gemma3nForConditionalGeneration.from_pretrained(
+                    model_name,
+                    device_map="auto",
+                    torch_dtype=torch.float16  # Safer than bfloat16
+                ).eval()
+                
+                logger.success(f"✅ Model {model_name} loaded on GPU with float16 (stable)")
+                return True
+                
+            except Exception as float16_error:
+                logger.warning(f"⚠️ float16 loading failed: {float16_error}")
+                
+        # Strategy 2: Try with bfloat16 (no quantization)
+        if torch.cuda.is_available():
+            try:
+                logger.info("🔄 Attempting GPU loading with bfloat16 (no quantization)...")
+                
+                self.processor = AutoProcessor.from_pretrained(model_name)
+                self.model = Gemma3nForConditionalGeneration.from_pretrained(
+                    model_name,
+                    device_map="auto",
+                    torch_dtype=torch.bfloat16  # Try bfloat16 without quantization
+                ).eval()
+                
+                logger.success(f"✅ Model {model_name} loaded on GPU with bfloat16 (no quantization)")
+                return True
+                
+            except Exception as bfloat16_error:
+                logger.warning(f"⚠️ bfloat16 loading failed: {bfloat16_error}")
+        
+        # Strategy 3: 8-bit quantization with float16 (if above fails)
+        if torch.cuda.is_available():
+            try:
+                logger.info("⚙️ Attempting 8-bit quantization with float16...")
                 bnb_config = BitsAndBytesConfig(load_in_8bit=True)
                 
                 self.processor = AutoProcessor.from_pretrained(model_name)
                 self.model = Gemma3nForConditionalGeneration.from_pretrained(
                     model_name,
                     device_map="auto",
-                    torch_dtype=torch.bfloat16,
+                    torch_dtype=torch.float16,  # Use float16 with quantization
                     quantization_config=bnb_config
                 ).eval()
                 
-                logger.success(f"✅ Model {model_name} loaded with 8-bit quantization (official classes)")
+                logger.success(f"✅ Model {model_name} loaded with 8-bit quantization + float16")
                 return True
                 
             except Exception as quant_error:
                 logger.warning(f"⚠️ 8-bit quantization failed: {quant_error}")
         
-        # Strategy 2: Standard GPU loading
-        if torch.cuda.is_available():
-            try:
-                logger.info("🔄 Attempting standard GPU loading (official classes)...")
-                
-                self.processor = AutoProcessor.from_pretrained(model_name)
-                self.model = Gemma3nForConditionalGeneration.from_pretrained(
-                    model_name,
-                    torch_dtype=torch.bfloat16
-                ).to(DEVICE).eval()
-                
-                logger.success(f"✅ Model {model_name} loaded on GPU (official classes)")
-                return True
-                
-            except Exception as gpu_error:
-                logger.warning(f"⚠️ GPU loading failed: {gpu_error}")
-        
-        # Strategy 3: CPU fallback
+        # Strategy 4: CPU fallback
         try:
-            logger.info("💻 Falling back to CPU (official classes)...")
+            logger.info("💻 Falling back to CPU...")
             
             self.processor = AutoProcessor.from_pretrained(model_name)
             self.model = Gemma3nForConditionalGeneration.from_pretrained(
@@ -107,7 +126,7 @@ class FrameCaptioner:
                 torch_dtype=torch.float32
             ).to("cpu").eval()
             
-            logger.success(f"✅ Model {model_name} loaded on CPU (official classes)")
+            logger.success(f"✅ Model {model_name} loaded on CPU")
             return True
             
         except Exception as cpu_error:
@@ -216,10 +235,10 @@ class FrameCaptioner:
         if not frames_to_process:
             logger.info("✅ All frames already processed! Using cached captions.")
         else:
-            logger.info(f"🚀 Processing {len(frames_to_process)} new frames with {min(4, len(frames_to_process))} threads...")
+            logger.info(f"🚀 Processing {len(frames_to_process)} new frames with single-threaded mode (stable approach)...")
             
-            # Parallel processing with ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=min(4, len(frames_to_process))) as executor:
+            # Single-threaded processing to avoid cublasLt conflicts
+            with ThreadPoolExecutor(max_workers=1) as executor:
                 # Submit all tasks
                 future_to_path = {
                     executor.submit(self.caption_frame_safe, frame_path): frame_path
