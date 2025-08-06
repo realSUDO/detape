@@ -1,364 +1,50 @@
-"""
-Caption Frames Module
-Generates captions for each extracted frame using Gemma 3n Vision
-"""
-# CUDA Memory Optimization - MUST be before torch imports
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
-
-# Suppress cuDNN/cuBLAS warnings
-import absl.logging
-absl.logging.set_verbosity('info')
-
-import torch
+import os, torch
 from PIL import Image
-from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig
-from typing import List, Dict
-from loguru import logger
+from transformers import pipeline
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
-import sys
+from loguru import logger
 
-from .extract_frames import extract_frames_from_video
-
-# Load configuration - Using official Gemma 3n multimodal model
-# PRIMARY: Gemma 3n E2B (2B params, ~2GB RAM, optimized for speed)
-MODEL_NAME = "google/gemma-3n-e2b-it"  # Official Gemma 3n instruction-tuned model
-# FALLBACK: Gemma 3n E4B for better quality if needed
-FALLBACK_MODEL = "google/gemma-3n-e4b-it"  # Larger Gemma 3n variant
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CAPTION_OUTPUT_DIR = "outputs/captions"
-
-logger.info(f"Using device: {DEVICE}")
-logger.info(f"Using Gemma 3n E2B model: {MODEL_NAME}")
-
-# Ensure output directory exists
-os.makedirs(CAPTION_OUTPUT_DIR, exist_ok=True)
+CAPTION_DIR = "outputs/captions"
+os.makedirs(CAPTION_DIR, exist_ok=True)
 
 class FrameCaptioner:
-    def __init__(self, model_name: str = MODEL_NAME):
-        self.processor = None
-        self.model = None
-        self.model_name = model_name
-        logger.info(f"Initializing FrameCaptioner with AutoModelForCausalLM (image captioning): {model_name}")
-    
-    def _inject_dummy_audio_features(self, inputs: dict) -> dict:
-        """OFFICIAL WORKAROUND: Inject dummy audio_features to bypass Gemma 3n audio requirement"""
-        if 'audio_features' not in inputs:
-            dummy_audio = torch.zeros(1, 80, 300, dtype=torch.float16).to(self.model.device)
-            inputs['audio_features'] = dummy_audio
-            logger.debug("✅ Injected dummy audio_features (Gemma 3n workaround)")
-        return inputs
-    
-    def _validate_generation_inputs(self, inputs: dict) -> bool:
-        """Validate inputs before calling model.generate()"""
-        required_keys = ['input_ids', 'attention_mask', 'audio_features']
-        for key in required_keys:
-            if key not in inputs:
-                logger.error(f"❌ Missing required input key: {key}")
-                return False
-        return True
-    
-    def _safe_model_generate(self, inputs: dict, **generation_kwargs) -> torch.Tensor:
-        """Centralized safe generation wrapper with validation and error handling"""
+    def __init__(self, device: int = 0):
+        self.device = torch.device(f"cuda:{device}" if torch.cuda.is_available() else "cpu")
+        self.pipe = pipeline(
+            "image-text-to-text",
+            model="google/gemma-3n-e2b-it",
+            device=device if torch.cuda.is_available() else -1,
+            torch_dtype=torch.bfloat16,
+        )
+
+    def caption_single(self, frame_path: str) -> str:
         try:
-            inputs = self._inject_dummy_audio_features(inputs)
-            if not self._validate_generation_inputs(inputs):
-                return None
-            
-            with torch.no_grad():
-                outputs = self.model.generate(**inputs, **generation_kwargs)
-            
-            if outputs is None or not isinstance(outputs, torch.Tensor) or outputs.numel() == 0:
-                logger.error(f"❌ Model returned invalid output: {outputs}")
-                return None
-            
-            return outputs
+            out = self.pipe(frame_path, text="<image_soft_token> Describe what is shown.")
+            caption = out[0]["generated_text"]
+            return caption.split("</s>")[-1].strip()
         except Exception as e:
-            logger.error(f"❌ Model generation failed: {e}")
-            return None
-    
-    def check_model_output_shape(self):
-        """Diagnostic helper to test model output with dummy inputs"""
-        try:
-            logger.info("🧪 Running model dummy output test...")
-            dummy_image = Image.new("RGB", (512, 512), (0, 0, 0))
-            dummy_text = "Describe this image."
-            
-            # CRITICAL FIX: Include both image AND text for Gemma 3n
-            inputs = self.processor(
-                images=dummy_image, 
-                text=dummy_text,
-                return_tensors="pt"
-            )
-            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-            
-            outputs = self._safe_model_generate(inputs, max_new_tokens=64, do_sample=False)
-            
-            if outputs is not None:
-                logger.info(f"🧪 Model dummy output shape: {outputs.shape}")
-                logger.info(f"🧪 Dummy test passed - model can generate outputs")
+            logger.error(f"Caption pipeline failed for {frame_path}: {e}")
+            return "Error: could not generate caption"
+
+    def caption_frames(self, frame_paths: list[str]) -> dict:
+        cached = {}
+        if os.path.exists("captions_cache.json"):
+            with open("captions_cache.json", "r") as f:
+                cached = json.load(f)
+
+        results = {}
+        for path in frame_paths:
+            name = os.path.basename(path)
+            if name in cached:
+                results[name] = cached[name]
+                logger.info(f"Skipping cached: {name}")
             else:
-                logger.error("🧪 Dummy output test returned None")
-        except Exception as e:
-            logger.error(f"❌ Dummy output test failed: {e}")
+                results[name] = self.caption_single(path)
+                with open(os.path.join(CAPTION_DIR, name.replace(".jpg", ".txt")), "w") as f:
+                    f.write(results[name])
 
-    def load_model(self):
-        """Load Gemma 3n model using official manual approach (avoids audio_features error)"""
-        logger.info(f"Loading Gemma 3n Vision model using official classes: {self.model_name}")
-        
-        # Try to load primary model with various strategies
-        success = self._try_load_model_configurations(self.model_name)
-        
-        # If primary model fails and we're using E2B, try fallback to E4B
-        if not success and self.model_name == MODEL_NAME:
-            logger.warning(f"⚠️ Primary model {self.model_name} failed, trying fallback model {FALLBACK_MODEL}")
-            self.model_name = FALLBACK_MODEL
-            success = self._try_load_model_configurations(self.model_name)
-        
-        if not success:
-            raise RuntimeError("❌ All model loading strategies failed")
-    
-    def _try_load_model_configurations(self, model_name: str) -> bool:
-        """Try different model loading configurations (stable approach to fix cublasLt error)"""
-        
-        # Strategy 1: Standard GPU loading with float16 (safer than bfloat16 + quantization)
-        if torch.cuda.is_available():
-            try:
-                logger.info("🚀 Attempting standard GPU loading with float16 (stable approach)...")
-                
-                self.processor = AutoProcessor.from_pretrained(model_name)
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    device_map="auto",
-                    torch_dtype=torch.float16  # Safer than bfloat16
-                ).eval()
-                
-                # Fix tokenizer pad_token for proper decoding
-                if self.processor.tokenizer.pad_token is None:
-                    self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
-                    logger.debug("Fixed tokenizer pad_token for decoding")
-                
-                logger.success(f"✅ Model {model_name} loaded on GPU with float16 (stable)")
-                logger.info(f"🗺️ Model device: {self.model.device}")
-                
-                # Run dummy test to verify model output
-                self.check_model_output_shape()
-                return True
-                
-            except Exception as float16_error:
-                logger.warning(f"⚠️ float16 loading failed: {float16_error}")
-                
-        # Strategy 2: Try with bfloat16 (no quantization)
-        if torch.cuda.is_available():
-            try:
-                logger.info("🔄 Attempting GPU loading with bfloat16 (no quantization)...")
-                
-                self.processor = AutoProcessor.from_pretrained(model_name)
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    device_map="auto",
-                    torch_dtype=torch.bfloat16  # Try bfloat16 without quantization
-                ).eval()
-                
-                logger.success(f"✅ Model {model_name} loaded on GPU with bfloat16 (no quantization)")
-                return True
-                
-            except Exception as bfloat16_error:
-                logger.warning(f"⚠️ bfloat16 loading failed: {bfloat16_error}")
-        
-        # Strategy 3: 8-bit quantization with float16 (if above fails)
-        if torch.cuda.is_available():
-            try:
-                logger.info("⚙️ Attempting 8-bit quantization with float16...")
-                bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-                
-                self.processor = AutoProcessor.from_pretrained(model_name)
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    device_map="auto",
-                    torch_dtype=torch.float16,  # Use float16 with quantization
-                    quantization_config=bnb_config
-                ).eval()
-                
-                logger.success(f"✅ Model {model_name} loaded with 8-bit quantization + float16")
-                return True
-                
-            except Exception as quant_error:
-                logger.warning(f"⚠️ 8-bit quantization failed: {quant_error}")
-        
-        # Strategy 4: CPU fallback
-        try:
-            logger.info("💻 Falling back to CPU...")
-            
-            self.processor = AutoProcessor.from_pretrained(model_name)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float32
-            ).to("cpu").eval()
-            
-            logger.success(f"✅ Model {model_name} loaded on CPU")
-            return True
-            
-        except Exception as cpu_error:
-            logger.error(f"❌ CPU loading failed: {cpu_error}")
-            return False
+        with open("captions_cache.json", "w") as f:
+            json.dump(results, f, indent=2)
+        return results
 
-    def caption_single_frame(self, image_path: str) -> str:
-        """Caption a single frame using safe generation wrapper (community workaround)"""
-        try:
-            # Load and resize image per official docs: 512x512 for memory control
-            image = Image.open(image_path).convert("RGB")
-            image = image.resize((512, 512), Image.Resampling.LANCZOS)
-            
-            # Official approach: use processor to handle image + text (CRITICAL FIX)
-            prompt_text = "Describe what you see in this image. Focus on any vehicles, people, activities, or incidents that might be occurring."
-            
-            # Process inputs with careful device placement (image + text approach)
-            inputs = self.processor(
-                images=image,
-                text=prompt_text,  # CRITICAL: Add text input for Gemma 3n
-                return_tensors="pt"
-            )
-            
-            # Move all inputs to model device (avoid device mismatch)
-            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-            
-            # Use centralized safe generation (handles dummy audio injection + validation)
-            outputs = self._safe_model_generate(
-                inputs,
-                max_new_tokens=128,
-                temperature=0.7,
-                do_sample=True,
-                pad_token_id=self.processor.tokenizer.eos_token_id,
-                use_cache=True
-            )
-            
-            # Check if safe generation failed
-            if outputs is None:
-                return "Error: Model generation failed"
-            
-            # Decode the output (safe since outputs validated by wrapper)
-            caption = self.processor.batch_decode(outputs, skip_special_tokens=True)[0]
-            
-            # Clean up the output (remove input prompt)
-            if prompt_text in caption:
-                caption = caption.replace(prompt_text, "").strip()
-            
-            # Clear CUDA cache after each frame (official recommendation)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            return caption.strip() if caption.strip() else "No description generated"
-            
-        except Exception as e:
-            logger.error(f"Failed to caption frame {image_path}: {e}")
-            # Clear CUDA cache even on error
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            return f"Error: Could not process {os.path.basename(image_path)}"
-
-    def caption_frame_safe(self, image_path: str) -> tuple:
-        """Thread-safe wrapper for frame captioning"""
-        frame_name = os.path.basename(image_path)
-        caption = self.caption_single_frame(image_path)
-        return frame_name, caption
-
-    def load_existing_captions(self) -> Dict[str, str]:
-        """Load existing captions from cache file"""
-        cache_file = os.path.join(CAPTION_OUTPUT_DIR, "captions_cache.json")
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'r') as f:
-                    cached_captions = json.load(f)
-                logger.info(f"Loaded {len(cached_captions)} cached captions")
-                return cached_captions
-            except Exception as e:
-                logger.warning(f"Failed to load caption cache: {e}")
-        return {}
-
-    def save_captions_cache(self, captions: Dict[str, str]):
-        """Save captions to cache file"""
-        cache_file = os.path.join(CAPTION_OUTPUT_DIR, "captions_cache.json")
-        try:
-            with open(cache_file, 'w') as f:
-                json.dump(captions, f, indent=2)
-            logger.info(f"Saved {len(captions)} captions to cache")
-        except Exception as e:
-            logger.error(f"Failed to save caption cache: {e}")
-
-    def caption_frames(self, video_path: str) -> List[str]:
-        if not self.model or not self.processor:
-            self.load_model()
-
-        # Extract frames
-        frame_paths = extract_frames_from_video(video_path)
-        
-        # Load existing captions (resume functionality)
-        cached_captions = self.load_existing_captions()
-        
-        # Filter out already processed frames
-        frames_to_process = []
-        captions_dict = {}
-        
-        for frame_path in frame_paths:
-            frame_name = os.path.basename(frame_path)
-            if frame_name in cached_captions:
-                captions_dict[frame_name] = cached_captions[frame_name]
-                logger.info(f"📋 Skipping cached frame: {frame_name}")
-            else:
-                frames_to_process.append(frame_path)
-        
-        if not frames_to_process:
-            logger.info("✅ All frames already processed! Using cached captions.")
-        else:
-            logger.info(f"🚀 Processing {len(frames_to_process)} new frames with single-threaded mode (stable approach)...")
-            
-            # Single-threaded processing to avoid cublasLt conflicts
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                # Submit all tasks
-                future_to_path = {
-                    executor.submit(self.caption_frame_safe, frame_path): frame_path
-                    for frame_path in frames_to_process
-                }
-                
-                # Process completed tasks
-                for i, future in enumerate(as_completed(future_to_path), 1):
-                    frame_path = future_to_path[future]
-                    frame_name, caption = future.result()
-                    
-                    captions_dict[frame_name] = caption
-                    logger.info(f"✅ [{i}/{len(frames_to_process)}] {frame_name}: {caption[:60]}...")
-                    
-                    # Save individual caption file
-                    self.save_caption(caption, frame_name)
-        
-        # Save updated cache
-        self.save_captions_cache(captions_dict)
-        
-        # Return captions in original frame order
-        captions = []
-        for frame_path in frame_paths:
-            frame_name = os.path.basename(frame_path)
-            captions.append(captions_dict.get(frame_name, "Error: Caption not found"))
-        
-        return captions
-
-    def save_caption(self, caption: str, frame_name: str):
-        # Save caption to a text file with the same name as the frame
-        caption_filename = os.path.join(CAPTION_OUTPUT_DIR, frame_name.replace('.jpg', '.txt'))
-        with open(caption_filename, "w") as f:
-            f.write(caption)
-        logger.info(f"Saved caption to {caption_filename}")
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 2:
-        print("Usage: python caption_frames.py <video_path>")
-        sys.exit(1)
-
-    video_path = sys.argv[1]
-    captioner = FrameCaptioner()
-    all_captions = captioner.caption_frames(video_path)
-
-    print(f"Generated {len(all_captions)} captions")
